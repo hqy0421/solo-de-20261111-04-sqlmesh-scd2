@@ -15,7 +15,7 @@
     "generate:api": "orval --config ./orval.config.ts"
   },
   "dependencies": {
-    "@codemirror/autocomplete": "^6.18.6",
+    "@codemirror/autocomplete": "^6.20.4",
     "@codemirror/commands": "^6.8.1",
     "@codemirror/lang-python": "^6.2.1",
     "@codemirror/lang-sql": "^6.9.0",
