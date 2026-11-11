@@ -2674,6 +2674,79 @@ def test_insert_into_scd_type_2_by_time(
     adapter_mock.columns.assert_called_once_with(snapshot.table_name())
 
 
+@pytest.mark.parametrize(
+    "intervals,truncate",
+    [
+        ([(to_timestamp("2024-01-01"), to_timestamp("2024-01-02"))], False),
+        ([], True),
+    ],
+)
+def test_insert_into_scd_type_2_by_time_multi_version_input(
+    adapter_mock, make_snapshot, intervals: Intervals, truncate: bool
+):
+    evaluator = SnapshotEvaluator(adapter_mock)
+    model = load_sql_based_model(
+        parse(  # type: ignore
+            """
+            MODEL (
+                name test_schema.test_model,
+                kind SCD_TYPE_2_BY_TIME (
+                    unique_key id,
+                    multi_version_input true
+                )
+            );
+
+            SELECT id::int, name::string, updated_at::timestamp FROM tbl;
+            """
+        )
+    )
+
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    snapshot.intervals = intervals
+
+    table_columns = {
+        "id": exp.DataType.build("INT"),
+        "name": exp.DataType.build("STRING"),
+        "updated_at": exp.DataType.build("TIMESTAMP"),
+        "valid_from": exp.DataType.build("TIMESTAMP"),
+        "valid_to": exp.DataType.build("TIMESTAMP"),
+    }
+    adapter_mock.columns.return_value = table_columns
+
+    evaluator.evaluate(
+        snapshot,
+        start="2020-01-01",
+        end="2020-01-02",
+        execution_time="2020-01-02",
+        snapshots={},
+    )
+
+    # The multi-version mode uses its dedicated adapter method and never the regular SCD path
+    adapter_mock.scd_type_2_by_time_multi_version.assert_called_once_with(
+        target_table=snapshot.table_name(),
+        source_table=model.render_query(),
+        target_columns_to_types=table_columns,
+        table_format=None,
+        unique_key=[exp.to_column("id", quoted=True)],
+        valid_from_col=exp.column("valid_from", quoted=True),
+        valid_to_col=exp.column("valid_to", quoted=True),
+        execution_time="2020-01-02",
+        updated_at_col=exp.column("updated_at", quoted=True),
+        table_description=None,
+        column_descriptions={},
+        truncate=truncate,
+        source_columns=None,
+        clustered_by=[],
+        partition_interval_unit=None,
+        partitioned_by=[],
+        storage_format=None,
+        table_properties={},
+    )
+    adapter_mock.scd_type_2_by_time.assert_not_called()
+    adapter_mock.columns.assert_called_once_with(snapshot.table_name())
+
+
 def test_create_scd_type_2_by_column(adapter_mock, make_snapshot):
     evaluator = SnapshotEvaluator(adapter_mock)
     model = load_sql_based_model(

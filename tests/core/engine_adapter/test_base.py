@@ -1620,6 +1620,294 @@ FROM (
     )
 
 
+def test_scd_type_2_by_time_multi_version_input(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+    # No ordering conflict and no same-timestamp content conflict
+    adapter.cursor.fetchone.return_value = None
+
+    adapter.scd_type_2_by_time_multi_version(
+        target_table="target",
+        source_table=t.cast(
+            exp.Select, parse_one("SELECT id, name, price, updated_at FROM source")
+        ),
+        unique_key=[exp.column("id")],
+        valid_from_col=exp.column("valid_from", quoted=True),
+        valid_to_col=exp.column("valid_to", quoted=True),
+        updated_at_col=exp.column("updated_at", quoted=True),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT"),
+            "name": exp.DataType.build("VARCHAR"),
+            "price": exp.DataType.build("DOUBLE"),
+            "updated_at": exp.DataType.build("TIMESTAMP"),
+            "valid_from": exp.DataType.build("TIMESTAMP"),
+            "valid_to": exp.DataType.build("TIMESTAMP"),
+        },
+        execution_time=datetime(2020, 1, 1, 0, 0, 0),
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    # Four portable precheck queries, a create-table DDL (mocked target does not exist) and the
+    # full table rewrite
+    assert len(sql_calls) == 6
+
+    null_precheck, conflict_precheck, null_key_precheck, ordering_precheck, _create_ddl, rewrite = (
+        sql_calls
+    )
+    # NULL event timestamp precheck filters on a NULL updated_at
+    assert "updated_at IS NULL" in null_precheck
+    # Same-timestamp content conflict precheck: groups by key + updated_at over distinct rows
+    assert "SELECT DISTINCT" in conflict_precheck
+    assert "GROUP BY" in conflict_precheck
+    assert "HAVING" in conflict_precheck
+    assert "COUNT(*) > 1" in conflict_precheck
+    # NULL business key precheck filters on a NULL key
+    assert "_key0 IS NULL" in null_key_precheck
+    # Open-version ordering precheck joins the source against the current open rows
+    assert '"valid_to" IS NULL' in ordering_precheck
+    assert "updated_at <= latest.valid_from" in ordering_precheck
+
+    # The rewrite keeps every event per key (no DISTINCT ON), builds the chain with self
+    # joins (no window functions) and stays idempotent through anti joins
+    assert "DISTINCT ON" not in rewrite
+    for cte in (
+        "source",
+        "with_prev",
+        "events",
+        "with_next",
+        "first_events",
+        "target_rows",
+        "static",
+        "latest",
+        "eligible",
+        "eligible_keys",
+        "closed_latest",
+        "kept_latest",
+        "new_versions",
+    ):
+        assert f'"{cte}" AS' in rewrite, cte
+    # Exact duplicate rows are collapsed
+    assert "SELECT DISTINCT" in rewrite
+    # No full join (unsupported by MySQL) and no window functions
+    assert "FULL JOIN" not in rewrite.upper()
+    assert "OVER (" not in rewrite.upper()
+    # Keys are threaded through source-derived CTEs under stable aliases, which also keeps
+    # expression-based unique_keys referenceable after the first projection
+    assert "_key0" in rewrite
+    assert "first_events" in rewrite
+    assert "_first_updated_at" in rewrite
+
+
+def test_scd_type_2_by_time_multi_version_input_conflict(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+    # The NULL-timestamp precheck passes, then the conflict precheck returns a group
+    adapter.cursor.fetchone.side_effect = [
+        None,
+        (1, datetime(2020, 1, 1, 0, 0, 0)),
+    ]
+
+    with pytest.raises(SQLMeshError, match="unique_key"):
+        adapter.scd_type_2_by_time_multi_version(
+            target_table="target",
+            source_table=t.cast(
+                exp.Select, parse_one("SELECT id, name, price, updated_at FROM source")
+            ),
+            unique_key=[exp.column("id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("updated_at", quoted=True),
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR"),
+                "price": exp.DataType.build("DOUBLE"),
+                "updated_at": exp.DataType.build("TIMESTAMP"),
+                "valid_from": exp.DataType.build("TIMESTAMP"),
+                "valid_to": exp.DataType.build("TIMESTAMP"),
+            },
+            execution_time=datetime(2020, 1, 1, 0, 0, 0),
+        )
+
+    # Only the two prechecks ran (fetchone executes the query); the rewrite must not happen
+    execute_calls = to_sql_calls(adapter)
+    assert len(execute_calls) == 2
+    assert "HAVING" in execute_calls[1]
+
+
+def test_scd_type_2_by_time_multi_version_input_null_timestamp(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+    # The first precheck finds a NULL event timestamp
+    adapter.cursor.fetchone.return_value = (1,)
+
+    with pytest.raises(SQLMeshError, match="NULL"):
+        adapter.scd_type_2_by_time_multi_version(
+            target_table="target",
+            source_table=t.cast(
+                exp.Select, parse_one("SELECT id, name, price, updated_at FROM source")
+            ),
+            unique_key=[exp.column("id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("updated_at", quoted=True),
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR"),
+                "price": exp.DataType.build("DOUBLE"),
+                "updated_at": exp.DataType.build("TIMESTAMP"),
+                "valid_from": exp.DataType.build("TIMESTAMP"),
+                "valid_to": exp.DataType.build("TIMESTAMP"),
+            },
+            execution_time=datetime(2020, 1, 1, 0, 0, 0),
+        )
+
+    # Nothing beyond the NULL precheck is executed
+    execute_calls = to_sql_calls(adapter)
+    assert len(execute_calls) == 1
+    assert "IS NULL" in execute_calls[0]
+
+
+def test_scd_type_2_by_time_multi_version_input_ordering_conflict(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+    # NULL-timestamp, content and NULL-key prechecks pass, then the ordering precheck finds one
+    adapter.cursor.fetchone.side_effect = [
+        None,
+        None,
+        None,
+        (1, datetime(2020, 1, 1, 0, 0, 0)),
+    ]
+
+    with pytest.raises(SQLMeshError, match="valid_from"):
+        adapter.scd_type_2_by_time_multi_version(
+            target_table="target",
+            source_table=t.cast(
+                exp.Select, parse_one("SELECT id, name, price, updated_at FROM source")
+            ),
+            unique_key=[exp.column("id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("updated_at", quoted=True),
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR"),
+                "price": exp.DataType.build("DOUBLE"),
+                "updated_at": exp.DataType.build("TIMESTAMP"),
+                "valid_from": exp.DataType.build("TIMESTAMP"),
+                "valid_to": exp.DataType.build("TIMESTAMP"),
+            },
+            execution_time=datetime(2020, 1, 1, 0, 0, 0),
+        )
+
+    # The four prechecks ran, no DDL or rewrite was issued
+    execute_calls = to_sql_calls(adapter)
+    assert len(execute_calls) == 4
+    assert "CREATE" not in execute_calls[3].upper()
+
+
+def test_scd_type_2_by_time_multi_version_input_truncate(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+    adapter.cursor.fetchone.return_value = None
+
+    adapter.scd_type_2_by_time_multi_version(
+        target_table="target",
+        source_table=t.cast(
+            exp.Select, parse_one("SELECT id, name, price, updated_at FROM source")
+        ),
+        unique_key=[exp.column("id")],
+        valid_from_col=exp.column("valid_from", quoted=True),
+        valid_to_col=exp.column("valid_to", quoted=True),
+        updated_at_col=exp.column("updated_at", quoted=True),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT"),
+            "name": exp.DataType.build("VARCHAR"),
+            "price": exp.DataType.build("DOUBLE"),
+            "updated_at": exp.DataType.build("TIMESTAMP"),
+            "valid_from": exp.DataType.build("TIMESTAMP"),
+            "valid_to": exp.DataType.build("TIMESTAMP"),
+        },
+        execution_time=datetime(2020, 1, 1, 0, 0, 0),
+        truncate=True,
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    # On truncate the target is treated as empty, so the NULL-timestamp, content and NULL-key
+    # prechecks run before the create-table DDL and rewrite (no ordering precheck)
+    assert len(sql_calls) == 5
+    assert "HAVING" in sql_calls[1]
+    assert "LIMIT 0" in sql_calls[4]
+
+
+@pytest.mark.parametrize("reserved_column", ["_key0", "_next_updated_at"])
+def test_scd_type_2_by_time_multi_version_input_reserved_column_name(
+    make_mocked_engine_adapter: t.Callable, reserved_column: str
+):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+
+    # Synthetic CTE aliases must never collide with a real column name, otherwise the chain
+    # silently drops versions or fails inside the engine; reject the configuration up front
+    with pytest.raises(SQLMeshError, match=reserved_column):
+        adapter.scd_type_2_by_time_multi_version(
+            target_table="target",
+            source_table=t.cast(
+                exp.Select, parse_one(f"SELECT id, {reserved_column}, updated_at FROM source")
+            ),
+            unique_key=[exp.column("id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("updated_at", quoted=True),
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                reserved_column: exp.DataType.build("VARCHAR"),
+                "updated_at": exp.DataType.build("TIMESTAMP"),
+                "valid_from": exp.DataType.build("TIMESTAMP"),
+                "valid_to": exp.DataType.build("TIMESTAMP"),
+            },
+            execution_time=datetime(2020, 1, 1, 0, 0, 0),
+        )
+
+    # The guard runs before any SQL is issued
+    assert to_sql_calls(adapter) == []
+
+
+def test_scd_type_2_by_time_multi_version_input_null_unique_key(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+    # NULL-timestamp and content prechecks pass, then the NULL unique-key precheck finds a row
+    adapter.cursor.fetchone.side_effect = [None, None, (None,)]
+
+    with pytest.raises(SQLMeshError, match="NULL"):
+        adapter.scd_type_2_by_time_multi_version(
+            target_table="target",
+            source_table=t.cast(
+                exp.Select, parse_one("SELECT id, name, price, updated_at FROM source")
+            ),
+            unique_key=[exp.column("id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("updated_at", quoted=True),
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "name": exp.DataType.build("VARCHAR"),
+                "price": exp.DataType.build("DOUBLE"),
+                "updated_at": exp.DataType.build("TIMESTAMP"),
+                "valid_from": exp.DataType.build("TIMESTAMP"),
+                "valid_to": exp.DataType.build("TIMESTAMP"),
+            },
+            execution_time=datetime(2020, 1, 1, 0, 0, 0),
+        )
+
+    # The three prechecks ran, no DDL or rewrite was issued
+    execute_calls = to_sql_calls(adapter)
+    assert len(execute_calls) == 3
+    assert "CREATE" not in execute_calls[2].upper()
+
+
 def test_scd_type_2_by_time_source_columns(make_mocked_engine_adapter: t.Callable):
     adapter = make_mocked_engine_adapter(EngineAdapter)
     df = pd.DataFrame(

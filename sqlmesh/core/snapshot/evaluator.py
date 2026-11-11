@@ -2681,28 +2681,52 @@ class SCDType2Strategy(IncrementalStrategy):
             force_get_columns_from_target=True,
         )
         if isinstance(model.kind, SCDType2ByTimeKind):
-            self.adapter.scd_type_2_by_time(
-                target_table=table_name,
-                source_table=query_or_df,
-                unique_key=model.unique_key,
-                valid_from_col=model.kind.valid_from_name,
-                valid_to_col=model.kind.valid_to_name,
-                execution_time=kwargs["execution_time"],
-                updated_at_col=model.kind.updated_at_name,
-                invalidate_hard_deletes=model.kind.invalidate_hard_deletes,
-                updated_at_as_valid_from=model.kind.updated_at_as_valid_from,
-                target_columns_to_types=columns_to_types,
-                table_format=model.table_format,
-                table_description=model.description,
-                column_descriptions=model.column_descriptions,
-                truncate=is_first_insert,
-                source_columns=source_columns,
-                storage_format=model.storage_format,
-                partitioned_by=model.partitioned_by,
-                partition_interval_unit=model.partition_interval_unit,
-                clustered_by=model.clustered_by,
-                table_properties=kwargs.get("physical_properties", model.physical_properties),
-            )
+            if model.kind.multi_version_input:
+                # Multi-version input preserves every change per key within a batch and does not
+                # support hard delete invalidation, so it uses a dedicated adapter code path
+                self.adapter.scd_type_2_by_time_multi_version(
+                    target_table=table_name,
+                    source_table=query_or_df,
+                    unique_key=model.unique_key,
+                    valid_from_col=model.kind.valid_from_name,
+                    valid_to_col=model.kind.valid_to_name,
+                    execution_time=kwargs["execution_time"],
+                    updated_at_col=model.kind.updated_at_name,
+                    target_columns_to_types=columns_to_types,
+                    table_format=model.table_format,
+                    table_description=model.description,
+                    column_descriptions=model.column_descriptions,
+                    truncate=is_first_insert,
+                    source_columns=source_columns,
+                    storage_format=model.storage_format,
+                    partitioned_by=model.partitioned_by,
+                    partition_interval_unit=model.partition_interval_unit,
+                    clustered_by=model.clustered_by,
+                    table_properties=kwargs.get("physical_properties", model.physical_properties),
+                )
+            else:
+                self.adapter.scd_type_2_by_time(
+                    target_table=table_name,
+                    source_table=query_or_df,
+                    unique_key=model.unique_key,
+                    valid_from_col=model.kind.valid_from_name,
+                    valid_to_col=model.kind.valid_to_name,
+                    execution_time=kwargs["execution_time"],
+                    updated_at_col=model.kind.updated_at_name,
+                    invalidate_hard_deletes=model.kind.invalidate_hard_deletes,
+                    updated_at_as_valid_from=model.kind.updated_at_as_valid_from,
+                    target_columns_to_types=columns_to_types,
+                    table_format=model.table_format,
+                    table_description=model.description,
+                    column_descriptions=model.column_descriptions,
+                    truncate=is_first_insert,
+                    source_columns=source_columns,
+                    storage_format=model.storage_format,
+                    partitioned_by=model.partitioned_by,
+                    partition_interval_unit=model.partition_interval_unit,
+                    clustered_by=model.clustered_by,
+                    table_properties=kwargs.get("physical_properties", model.physical_properties),
+                )
         elif isinstance(model.kind, SCDType2ByColumnKind):
             self.adapter.scd_type_2_by_column(
                 target_table=table_name,

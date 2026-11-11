@@ -1822,6 +1822,55 @@ class EngineAdapter:
             **kwargs,
         )
 
+    def scd_type_2_by_time_multi_version(
+        self,
+        target_table: TableName,
+        source_table: QueryOrDF,
+        unique_key: t.Sequence[exp.Expr],
+        valid_from_col: exp.Column,
+        valid_to_col: exp.Column,
+        execution_time: t.Union[TimeLike, exp.Column],
+        updated_at_col: exp.Column,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        truncate: bool = False,
+        source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        """Rewrite an SCD Type 2 By Time target while preserving every change within the batch.
+
+        Each distinct event for a ``unique_key`` becomes its own version. Versions form a
+        half-open ``[valid_from, valid_to)`` interval chain keyed by the event timestamp, and the
+        chain is joined onto the target's current open version so that exactly one open row per
+        key remains; keys absent from the batch are left untouched.
+
+        Validation runs through portable precheck queries before the single table rewrite and
+        raises a ``SQLMeshError`` when:
+            - an event has a NULL ``updated_at`` or a NULL unique-key value;
+            - the same key carries different contents at the same ``updated_at``;
+            - an event is not newer than the open row's ``valid_from`` while its contents differ.
+
+        Hard deletes are not invalidated in this mode. ``execution_time`` is accepted for a
+        uniform SCD Type 2 adapter signature but intentionally unused, because ``valid_from`` is
+        always derived from the event timestamp.
+        """
+        self._scd_type_2_multi_version(
+            target_table=target_table,
+            source_table=source_table,
+            unique_key=unique_key,
+            valid_from_col=valid_from_col,
+            valid_to_col=valid_to_col,
+            execution_time=execution_time,
+            updated_at_col=updated_at_col,
+            target_columns_to_types=target_columns_to_types,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            truncate=truncate,
+            source_columns=source_columns,
+            **kwargs,
+        )
+
     def scd_type_2_by_column(
         self,
         target_table: TableName,
@@ -2239,6 +2288,690 @@ class EngineAdapter:
                     )
                     .from_("joined")
                     .where(updated_row_filter),
+                )
+            )
+
+            self.replace_query(
+                target_table,
+                self.ensure_nulls_for_unmatched_after_join(query),
+                target_columns_to_types=target_columns_to_types,
+                table_description=table_description,
+                column_descriptions=column_descriptions,
+                **kwargs,
+            )
+
+    def _scd_type_2_multi_version(
+        self,
+        target_table: TableName,
+        source_table: QueryOrDF,
+        unique_key: t.Sequence[exp.Expr],
+        valid_from_col: exp.Column,
+        valid_to_col: exp.Column,
+        # Retained for a uniform SCD2 adapter signature with `_scd_type_2`; it is intentionally
+        # unused here because valid_from is always the event timestamp in multi-version mode.
+        execution_time: t.Union[TimeLike, exp.Column],
+        updated_at_col: exp.Column,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        truncate: bool = False,
+        source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        # Multi-version input mode preserves every change of a business key within a batch and
+        # builds the complete half-open [valid_from, valid_to) interval chain per key.
+        # Hard deletes are not invalidated in this mode: keys missing from an incremental batch
+        # are left untouched. Only portable SQL constructs are used (CTEs, joins, GROUP BY,
+        # aggregates, UNION ALL, subqueries, CASE) - window functions and full joins are avoided.
+        def remove_managed_columns(
+            cols_to_types: t.Dict[str, exp.DataType],
+        ) -> t.Dict[str, exp.DataType]:
+            return {
+                k: v for k, v in cols_to_types.items() if k not in {valid_from_name, valid_to_name}
+            }
+
+        def null_safe_same_content(
+            left_table: str,
+            right_table: str,
+            columns_to_types: t.Dict[str, exp.DataType],
+            exclude_columns: t.Optional[t.Set[str]] = None,
+        ) -> exp.Condition:
+            # Two rows carry the same content when every compared column is equal or both NULL.
+            # `updated_at` is excluded when comparing adjacent events since it differs by design
+            # and is the event timestamp rather than part of the row contents.
+            excluded = exclude_columns or set()
+            return exp.and_(
+                *[
+                    exp.or_(
+                        exp.column(col, table=left_table).eq(exp.column(col, table=right_table)),
+                        exp.and_(
+                            exp.column(col, table=left_table).is_(exp.Null()),
+                            exp.column(col, table=right_table).is_(exp.Null()),
+                        ),
+                    )
+                    for col in columns_to_types
+                    if col not in excluded
+                ]
+            )
+
+        valid_from_name = valid_from_col.name
+        valid_to_name = valid_to_col.name
+        updated_at_name = updated_at_col.name
+        target_columns_to_types = target_columns_to_types or self.columns(target_table)
+        if (
+            valid_from_name not in target_columns_to_types
+            or valid_to_name not in target_columns_to_types
+            or not columns_to_types_all_known(target_columns_to_types)
+        ):
+            target_columns_to_types = self.columns(target_table)
+        unmanaged_columns_to_types = (
+            remove_managed_columns(target_columns_to_types) if target_columns_to_types else None
+        )
+        (
+            source_queries,
+            unmanaged_columns_to_types,
+        ) = self._get_source_queries_and_columns_to_types(
+            source_table,
+            unmanaged_columns_to_types,
+            target_table=target_table,
+            batch_size=0,
+            source_columns=source_columns,
+        )
+        if not target_columns_to_types:
+            raise SQLMeshError(f"Could not get columns_to_types. Does {target_table} exist?")
+        unmanaged_columns_to_types = unmanaged_columns_to_types or remove_managed_columns(
+            target_columns_to_types
+        )
+        if not unique_key:
+            raise SQLMeshError("unique_key must be provided for SCD Type 2")
+        if updated_at_name not in target_columns_to_types:
+            raise SQLMeshError(
+                f"Column {updated_at_name} not found in {target_table}. Table must contain an "
+                "`updated_at` timestamp for SCD Type 2"
+            )
+
+        time_data_type = target_columns_to_types[valid_from_name]
+        select_source_columns: t.List[t.Union[str, exp.Alias]] = [
+            col for col in unmanaged_columns_to_types if col != updated_at_name
+        ]
+        # Keep the source `updated_at` cast to the target time type, mirroring the regular SCD path
+        select_source_columns.append(
+            exp.cast(updated_at_col, time_data_type).as_(updated_at_col.this)  # type: ignore
+        )
+        table_columns = [exp.column(c, quoted=True) for c in target_columns_to_types]
+        source_key_aliases = [f"_key{i}" for i in range(len(unique_key))]
+        source_key_expressions = [
+            part.as_(alias) for part, alias in zip(unique_key, source_key_aliases)
+        ]
+        source_key_columns = [exp.column(alias, table="source") for alias in source_key_aliases]
+
+        # Synthetic names introduced by the internal CTEs. A real column sharing one of these
+        # names would be shadowed or referenced ambiguously inside the generated SQL, which can
+        # silently drop versions or raise an engine error, so reject the configuration explicitly.
+        reserved_names = {
+            *source_key_aliases,
+            "_prev_updated_at",
+            "_next_updated_at",
+            "_first_updated_at",
+            "_static_valid_from",
+            "_latest_valid_from",
+        }
+        conflicting_columns = sorted(
+            reserved_names & (set(target_columns_to_types) | set(unmanaged_columns_to_types))
+        )
+        if conflicting_columns:
+            raise SQLMeshError(
+                "The following column names collide with internal aliases used by multi-version "
+                f"input mode and are not allowed: {', '.join(conflicting_columns)}. Rename the "
+                "columns (for example with a leading business prefix) before loading the model."
+            )
+
+        def source_key_join_conditions(left_table: str, right_table: str) -> exp.Condition:
+            return exp.and_(
+                *[
+                    exp.column(alias, table=left_table).eq(exp.column(alias, table=right_table))
+                    for alias in source_key_aliases
+                ]
+            )
+
+        with source_queries[0] as source_query:
+            # Collapse fully identical rows (same key, timestamp and content) up front
+            source_cte = (
+                exp.select(*source_key_expressions, *select_source_columns)
+                .distinct()
+                .from_(
+                    self.use_server_nulls_for_unmatched_after_join(source_query).subquery(  # type: ignore
+                        "raw_source"
+                    )
+                )
+            )
+
+            # The validation prechecks below and the final replace_query are separate statements, so
+            # they are not atomic. This relies on the same single-writer serial batch assumption as
+            # the regular SCD Type 2 path; concurrent writers mutating the target mid-batch are out
+            # of scope for the guarantee.
+            # Precheck 0: a NULL event timestamp cannot be ordered into a half-open interval chain
+            # and would otherwise produce a second open row for the key, so reject it up front.
+            null_timestamp = self.fetchone(
+                exp.Select()
+                .with_("source", source_cte)
+                .select(*source_key_columns)
+                .from_("source")
+                .where(exp.column(updated_at_name, table="source").is_(exp.Null()))
+                .limit(1)
+            )
+            if null_timestamp is not None:
+                key_values = ", ".join(str(v) for v in null_timestamp)
+                raise SQLMeshError(
+                    f"Received a change for unique_key ({key_values}) with a NULL "
+                    f"{updated_at_name} timestamp while multi_version_input is enabled. Every "
+                    "change of a key must carry a distinct timestamp to build the validity chain."
+                )
+
+            # Precheck 1: a (unique_key, updated_at) group with more than one row means the same
+            # key changed to different contents at the same timestamp, which cannot be ordered into
+            # a half-open interval chain. Fail before touching the target table.
+            conflict_query = (
+                exp.select(*source_key_columns, updated_at_col.copy())
+                .from_("source")
+                .group_by(*source_key_columns, updated_at_col.copy())
+                .having(exp.GT(this=exp.Count(this=exp.Star()), expression=exp.convert(1)))
+                .limit(1)
+            )
+            conflict = self.fetchone(
+                exp.Select()
+                .with_("source", source_cte)
+                .select("*")
+                .from_(conflict_query.subquery("_conflict"))
+            )
+            if conflict is not None:
+                key_values = ", ".join(str(v) for v in conflict[:-1])
+                raise SQLMeshError(
+                    f"Received multiple changes for unique_key ({key_values}) with the same "
+                    f"{updated_at_name} timestamp ({conflict[-1]}) but different contents while "
+                    "multi_version_input is enabled. Resolve the conflicting source rows so that "
+                    "each change of a key has a distinct timestamp."
+                )
+
+            # Precheck 1b: a NULL business key cannot participate in the equi-join interval chain
+            # and would be silently dropped from the output, so reject it explicitly up front.
+            null_key_conditions = exp.or_(
+                *[exp.column(alias, table="source").is_(exp.Null()) for alias in source_key_aliases]
+            )
+            null_key = self.fetchone(
+                exp.Select()
+                .with_("source", source_cte)
+                .select(*source_key_columns)
+                .from_("source")
+                .where(null_key_conditions)
+                .limit(1)
+            )
+            if null_key is not None:
+                key_columns = ", ".join(part.sql() for part in unique_key)
+                raise SQLMeshError(
+                    f"Received a change with a NULL unique_key ({key_columns}) while "
+                    "multi_version_input is enabled. Every change must carry a non-NULL business "
+                    "key so it can be ordered into the validity interval chain."
+                )
+
+            existing_rows_query = exp.select(*table_columns).from_(target_table)
+            if truncate:
+                # Wrap the target in an empty subquery so every reference to the existing rows
+                # (target_rows, latest) is guaranteed empty, including when extra WHERE clauses
+                # are appended to the CTEs
+                empty_target = exp.select(*table_columns).from_(
+                    existing_rows_query.limit(0).subquery("_empty_target")
+                )
+                target_rows_cte = empty_target
+                latest_cte = empty_target.where(valid_to_col.is_(exp.Null()))
+            else:
+                target_rows_cte = existing_rows_query
+                latest_cte = existing_rows_query.where(valid_to_col.is_(exp.Null()))
+
+            if not truncate:
+                # Precheck 2: an event at or before the current open row's valid_from with different
+                # contents would produce overlapping / out-of-order intervals. The exemptions here
+                # must mirror the write path's `eligible` rules exactly, otherwise re-running an
+                # already applied batch can be wrongly rejected:
+                #   - an exact closed-history match (same timestamp + contents) is always a replay;
+                #   - content matching the current open row is always a no-op (a replayed duplicate
+                #     may sit at any batch position), regardless of the event timestamp;
+                #   - the batch's FIRST event per key is additionally exempt when its contents equal
+                #     any closed row of that key: this covers an open-content no-op skipped on a
+                #     previous run, whose contents have since moved into the closed history.
+                static_cte = (
+                    exp.select(*table_columns)
+                    .from_(target_table)
+                    .where(valid_to_col.is_(exp.Null()).not_())
+                )
+                # Per-key earliest event timestamp, equivalent to the `first_events` CTE used by
+                # the write path but derived directly from the distinct source rows.
+                precheck_first_events = (
+                    exp.select(
+                        *source_key_columns,
+                        exp.Min(this=updated_at_col.copy()).as_("_first_updated_at"),
+                    )
+                    .from_("source")
+                    .group_by(*source_key_columns)
+                )
+                # Content-only equality against the open row and against any closed row; the event
+                # timestamp is excluded since a replayed duplicate differs in updated_at by design.
+                same_as_open_row = null_safe_same_content(
+                    "source",
+                    "latest",
+                    unmanaged_columns_to_types,
+                    exclude_columns={updated_at_name},
+                )
+                same_as_static_content = null_safe_same_content(
+                    "source",
+                    "static_content",
+                    unmanaged_columns_to_types,
+                    exclude_columns={updated_at_name},
+                )
+                same_as_history = exp.and_(
+                    exp.column(updated_at_name, table="source").eq(
+                        exp.column(valid_from_name, table="static")
+                    ),
+                    null_safe_same_content("source", "static", unmanaged_columns_to_types),
+                )
+                is_first_event = exp.column(updated_at_name, table="source").eq(
+                    exp.column("_first_updated_at", table="precheck_first_events")
+                )
+                # Open-row content duplicates are no-ops at any position; a closed-content match is
+                # only safe to skip for the first event, mirroring the write path's first-event rule.
+                first_event_static_no_op = exp.and_(is_first_event, same_as_static_content)
+                ordering_exemption = exp.or_(same_as_open_row, first_event_static_no_op)
+                ordering_query = (
+                    exp.select(
+                        *source_key_columns,
+                        exp.column(updated_at_name, table="source"),
+                    )
+                    .from_("source")
+                    .join(
+                        "latest",
+                        on=exp.and_(
+                            *[
+                                exp.column(alias, table="source").eq(add_table(part, "latest"))
+                                for alias, part in zip(source_key_aliases, unique_key)
+                            ]
+                        ),
+                        join_type="inner",
+                    )
+                    .join(
+                        "precheck_first_events",
+                        on=source_key_join_conditions("source", "precheck_first_events"),
+                        join_type="inner",
+                    )
+                    .join(
+                        "static",
+                        on=exp.and_(
+                            *[
+                                exp.column(alias, table="source").eq(add_table(part, "static"))
+                                for alias, part in zip(source_key_aliases, unique_key)
+                            ],
+                            same_as_history,
+                        ),
+                        join_type="left",
+                    )
+                    .join(
+                        "static_content",
+                        on=exp.and_(
+                            *[
+                                exp.column(alias, table="source").eq(
+                                    add_table(part, "static_content")
+                                )
+                                for alias, part in zip(source_key_aliases, unique_key)
+                            ],
+                            same_as_static_content,
+                        ),
+                        join_type="left",
+                    )
+                    .where(
+                        exp.and_(
+                            exp.column(updated_at_name, table="source")
+                            <= exp.column(valid_from_name, table="latest"),
+                            exp.column(valid_from_name, table="static").is_(exp.Null()),
+                            ordering_exemption.not_(),
+                        )
+                    )
+                    .limit(1)
+                    .with_("source", source_cte)
+                    .with_("latest", latest_cte)
+                    .with_("static", static_cte)
+                    .with_("static_content", static_cte)
+                    .with_("precheck_first_events", precheck_first_events)
+                )
+                # The prechecks and the rewrite below are separate statements and rely on the
+                # same single-writer serial batch assumption as the regular SCD Type 2 path.
+                ordering_conflict = self.fetchone(ordering_query)
+                if ordering_conflict is not None:
+                    key_values = ", ".join(str(v) for v in ordering_conflict[:-1])
+                    raise SQLMeshError(
+                        f"Received a change for unique_key ({key_values}) at {updated_at_name} "
+                        f"{ordering_conflict[-1]} that is not newer than the current open row's "
+                        f"{valid_from_name} while multi_version_input is enabled. Apply source "
+                        "changes in chronological order to avoid overlapping validity intervals."
+                    )
+
+            # `with_prev` finds the preceding event timestamp per key through a self join
+            # (LEAD/LAG window functions are not portable), then `events` drops adjacent no-op
+            # events whose contents did not change compared with their predecessor.
+            prev_join_conditions: t.List[exp.Condition] = [
+                exp.column(alias, table="p").eq(exp.column(alias, table="cur"))
+                for alias in source_key_aliases
+            ]
+            prev_join_conditions.append(
+                exp.column(updated_at_name, table="p") < exp.column(updated_at_name, table="cur")
+            )
+            with_prev = (
+                exp.select(
+                    *(exp.column(col, table="cur").as_(col) for col in unmanaged_columns_to_types),
+                    *(exp.column(alias, table="cur").as_(alias) for alias in source_key_aliases),
+                    exp.Max(this=exp.column(updated_at_name, table="p")).as_("_prev_updated_at"),
+                )
+                .from_(exp.alias_(exp.to_table("source"), "cur", table=True))
+                .join(
+                    exp.alias_(exp.to_table("source"), "p", table=True),
+                    on=exp.and_(*prev_join_conditions),
+                    join_type="left",
+                )
+                .group_by(
+                    *(
+                        exp.column(col, table="cur")
+                        for col in [*unmanaged_columns_to_types, *source_key_aliases]
+                    )
+                )
+            )
+            events = (
+                exp.select(
+                    *[
+                        exp.column(col, table="with_prev").as_(col)
+                        for col in unmanaged_columns_to_types
+                    ],
+                    *(
+                        exp.column(alias, table="with_prev").as_(alias)
+                        for alias in source_key_aliases
+                    ),
+                )
+                .from_("with_prev")
+                .join(
+                    exp.alias_(exp.to_table("with_prev"), "prev_event", table=True),
+                    on=exp.and_(
+                        *[
+                            exp.column(alias, table="with_prev").eq(
+                                exp.column(alias, table="prev_event")
+                            )
+                            for alias in source_key_aliases
+                        ],
+                        exp.column("_prev_updated_at", table="with_prev").eq(
+                            exp.column(updated_at_name, table="prev_event")
+                        ),
+                    ),
+                    join_type="left",
+                )
+                .where(
+                    exp.or_(
+                        exp.column("_prev_updated_at", table="with_prev").is_(exp.Null()),
+                        null_safe_same_content(
+                            "with_prev",
+                            "prev_event",
+                            unmanaged_columns_to_types,
+                            exclude_columns={updated_at_name},
+                        ).not_(),
+                    )
+                )
+            )
+
+            # `with_next` assigns each event the following event timestamp within its key, which
+            # becomes its `valid_to`. The last event of a key stays open (valid_to IS NULL).
+            next_join_conditions: t.List[exp.Condition] = [
+                exp.column(alias, table="n").eq(exp.column(alias, table="e"))
+                for alias in source_key_aliases
+            ]
+            next_join_conditions.append(
+                exp.column(updated_at_name, table="n") > exp.column(updated_at_name, table="e")
+            )
+            with_next = (
+                exp.select(
+                    *(exp.column(col, table="e").as_(col) for col in unmanaged_columns_to_types),
+                    *(exp.column(alias, table="e").as_(alias) for alias in source_key_aliases),
+                    exp.Min(this=exp.column(updated_at_name, table="n")).as_("_next_updated_at"),
+                )
+                .from_(exp.alias_(exp.to_table("events"), "e", table=True))
+                .join(
+                    exp.alias_(exp.to_table("events"), "n", table=True),
+                    on=exp.and_(*next_join_conditions),
+                    join_type="left",
+                )
+                .group_by(
+                    *(
+                        exp.column(col, table="e")
+                        for col in [*unmanaged_columns_to_types, *source_key_aliases]
+                    )
+                )
+            )
+
+            # `eligible` keeps source events that are not already recorded: anti join against the
+            # closed history (same valid_from + contents) and against the current open row, plus
+            # the chronological guard against events older than the open row. An event whose
+            # contents match the open row is only a cross-batch no-op when it is the FIRST event
+            # of its key in the batch: at any later position it is a genuine reversion (e.g. an
+            # X -> Y -> X flip) and must become its own open version, otherwise the key would be
+            # left without an open row and the half-open chain would break.
+            open_row_content_match = null_safe_same_content(
+                "with_next",
+                "latest",
+                unmanaged_columns_to_types,
+                exclude_columns={updated_at_name},
+            )
+            first_events = (
+                exp.select(
+                    *[exp.column(alias, table="events").as_(alias) for alias in source_key_aliases],
+                    exp.Min(this=exp.column(updated_at_name, table="events")).as_(
+                        "_first_updated_at"
+                    ),
+                )
+                .from_("events")
+                .group_by(*[exp.column(alias, table="events") for alias in source_key_aliases])
+            )
+            eligible = (
+                exp.select(
+                    *(
+                        exp.column(col, table="with_next").as_(col)
+                        for col in unmanaged_columns_to_types
+                    ),
+                    *(
+                        exp.column(alias, table="with_next").as_(alias)
+                        for alias in source_key_aliases
+                    ),
+                )
+                .from_("with_next")
+                .join(
+                    "static",
+                    on=exp.and_(
+                        *[
+                            exp.column(alias, table="with_next").eq(add_table(part, "static"))
+                            for alias, part in zip(source_key_aliases, unique_key)
+                        ],
+                        exp.column(updated_at_name, table="with_next").eq(
+                            exp.column(valid_from_name, table="static")
+                        ),
+                        null_safe_same_content("with_next", "static", unmanaged_columns_to_types),
+                    ),
+                    join_type="left",
+                )
+                .join(
+                    "latest",
+                    on=exp.and_(
+                        *[
+                            exp.column(alias, table="with_next").eq(add_table(part, "latest"))
+                            for alias, part in zip(source_key_aliases, unique_key)
+                        ]
+                    ),
+                    join_type="left",
+                )
+                .join(
+                    "first_events",
+                    on=source_key_join_conditions("with_next", "first_events"),
+                    join_type="inner",
+                )
+                .where(
+                    exp.and_(
+                        # Reference the joined source columns directly rather than the SELECT-level
+                        # aliases, so the predicate stays unambiguous and engine-portable
+                        exp.column(valid_from_name, table="static").is_(exp.Null()),
+                        exp.or_(
+                            exp.column(valid_from_name, table="latest").is_(exp.Null()),
+                            exp.and_(
+                                exp.column(updated_at_name, table="with_next")
+                                > exp.column(valid_from_name, table="latest"),
+                                exp.or_(
+                                    exp.column(updated_at_name, table="with_next").neq(
+                                        exp.column("_first_updated_at", table="first_events")
+                                    ),
+                                    open_row_content_match.not_(),
+                                ),
+                            ),
+                        ),
+                    )
+                )
+            )
+            eligible_keys = (
+                exp.select(
+                    *[
+                        exp.column(alias, table="eligible").as_(alias)
+                        for alias in source_key_aliases
+                    ]
+                )
+                .from_("eligible")
+                .group_by(*[exp.column(alias, table="eligible") for alias in source_key_aliases])
+            )
+
+            final_rows = (
+                exp.select(*table_columns)
+                .from_("static")
+                .union(exp.select(*table_columns).from_("kept_latest"), distinct=False)
+                .union(exp.select(*table_columns).from_("closed_latest"), distinct=False)
+                .union(exp.select(*table_columns).from_("new_versions"), distinct=False)
+            )
+            query = (
+                exp.select(
+                    *(
+                        exp.cast(exp.column(col), target_columns_to_types[col]).as_(
+                            col, quoted=True
+                        )
+                        for col in target_columns_to_types
+                    )
+                )
+                .from_(final_rows.subquery("_subquery"))
+                .with_("target_rows", target_rows_cte)
+                # Closed historical rows are always carried over unchanged
+                .with_(
+                    "static",
+                    exp.select(*table_columns)
+                    .from_("target_rows")
+                    .where(valid_to_col.is_(exp.Null()).not_()),
+                )
+                # The single open row per key (keys absent from the batch stay untouched)
+                .with_("latest", latest_cte)
+                .with_("source", source_cte)
+                .with_("with_prev", with_prev)
+                .with_("events", events)
+                .with_("with_next", with_next)
+                .with_("first_events", first_events)
+                .with_("eligible", eligible)
+                .with_("eligible_keys", eligible_keys)
+                # Close the current open row when at least one newer event exists for its key
+                .with_(
+                    "closed_latest",
+                    exp.select(
+                        *(
+                            exp.column(col, table="latest").as_(col)
+                            for col in unmanaged_columns_to_types
+                        ),
+                        exp.column(valid_from_name, table="latest").as_(valid_from_col.this),
+                        exp.Min(this=exp.column(updated_at_name, table="eligible")).as_(
+                            valid_to_col.this
+                        ),
+                    )
+                    .from_("latest")
+                    .join(
+                        "eligible",
+                        on=exp.and_(
+                            *[
+                                add_table(part, "latest").eq(exp.column(alias, table="eligible"))
+                                for alias, part in zip(source_key_aliases, unique_key)
+                            ]
+                        ),
+                        join_type="inner",
+                    )
+                    .group_by(
+                        *(exp.column(col, table="latest") for col in unmanaged_columns_to_types),
+                        exp.column(valid_from_name, table="latest"),
+                    ),
+                )
+                # Open rows without any newer event remain open as-is (anti join keeps keys that
+                # have no eligible event, including keys absent from the batch)
+                .with_(
+                    "kept_latest",
+                    exp.select(
+                        *[
+                            exp.column(col, table="latest").as_(col)
+                            for col in target_columns_to_types
+                        ]
+                    )
+                    .from_("latest")
+                    .join(
+                        "eligible_keys",
+                        on=exp.and_(
+                            *[
+                                add_table(part, "latest").eq(
+                                    exp.column(alias, table="eligible_keys")
+                                )
+                                for alias, part in zip(source_key_aliases, unique_key)
+                            ]
+                        ),
+                        join_type="left",
+                    )
+                    # All key aliases are NULL together when the left join finds no match
+                    .where(
+                        exp.and_(
+                            *[
+                                exp.column(alias, table="eligible_keys").is_(exp.Null())
+                                for alias in source_key_aliases
+                            ]
+                        )
+                    ),
+                )
+                # New versions from the eligible event chain; the last event per key stays open.
+                # The join is event-level (key + updated_at) against `eligible`, so that a batch
+                # replaying already recorded events together with new events only emits the latter.
+                .with_(
+                    "new_versions",
+                    exp.select(
+                        *(
+                            exp.column(col, table="with_next").as_(col)
+                            for col in unmanaged_columns_to_types
+                        ),
+                        exp.column(updated_at_name, table="with_next").as_(valid_from_col.this),
+                        exp.column("_next_updated_at", table="with_next").as_(valid_to_col.this),
+                    )
+                    .from_("with_next")
+                    .join(
+                        "eligible",
+                        on=exp.and_(
+                            *[
+                                exp.column(alias, table="with_next").eq(
+                                    exp.column(alias, table="eligible")
+                                )
+                                for alias in source_key_aliases
+                            ],
+                            exp.column(updated_at_name, table="with_next").eq(
+                                exp.column(updated_at_name, table="eligible")
+                            ),
+                        ),
+                        join_type="inner",
+                    ),
                 )
             )
 

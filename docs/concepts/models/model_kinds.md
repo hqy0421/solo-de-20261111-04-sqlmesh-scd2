@@ -1005,6 +1005,39 @@ TABLE db.menu_items (
 );
 ```
 
+#### Multi-version input mode
+
+By default, an SCD Type 2 By Time model keeps only the latest row per `unique_key` within each batch. When a source system emits several changes for the same key between two SQLMesh runs, the intermediate states are lost before they reach the target table.
+
+Set `multi_version_input true` to preserve every change of a business key within a batch. Each content change becomes its own version, and SQLMesh builds the complete half-open validity interval chain per key and joins it onto the table's current open version:
+
+```sql linenums="1" hl_lines="5"
+MODEL (
+  name db.menu_items,
+  kind SCD_TYPE_2_BY_TIME (
+    unique_key id,
+    multi_version_input true
+  )
+);
+```
+
+In this mode SQLMesh:
+
+- Collapses fully duplicate rows (identical `updated_at` and contents) with `SELECT DISTINCT`, while keeping every genuine content change.
+- Sets `valid_from` to the event's `updated_at` timestamp and `valid_to` to the next event's `updated_at` within the same key. The last event keeps `valid_to = NULL`, so exactly one open version exists per key.
+- Drops no-op events: an event whose contents are identical to its predecessor never creates a new version, and an event that repeats the current open row's contents as the first event of a batch is skipped as well. An event later in the batch that merely happens to match the open row (for example an `X -> Y -> X` flip) is still a genuine reversion and becomes its own open version, so every key always keeps exactly one open row.
+- Closes the current open row of a key when a newer event arrives, and leaves keys absent from the batch untouched.
+- Rejects the batch before writing anything if an event has a NULL `updated_at`, if a business key is NULL, if the same key carries different contents at the same `updated_at`, or if an event is not newer than the current open row's `valid_from` while its contents differ. These cases raise a `SQLMeshError`, so source changes must be applied in chronological order and carry a non-NULL event timestamp and business key.
+- Skips events already present in the target, which makes re-running an unchanged batch idempotent. This also holds when the batch's first event is a no-op that repeats the open row's contents: the ordering precheck grants the same first-event content exemption as the materialization itself, so the batch stays re-runnable after the open row has advanced.
+
+Note that hard deletes are not invalidated in this mode; combining `multi_version_input true` with `invalidate_hard_deletes true` raises a configuration error. The same applies to `updated_at_as_valid_from true`, because `valid_from` is always derived from the event timestamp in this mode.
+
+`multi_version_input` is only supported on `SCD_TYPE_2_BY_TIME`; setting it on `SCD_TYPE_2_BY_COLUMN` raises a configuration error. It defaults to `false`, so existing models keep their original single-version behavior.
+
+Model columns must not use the internal alias names `_key0`, `_key1`, ..., `_prev_updated_at`, `_next_updated_at`, `_first_updated_at`, `_static_valid_from`, or `_latest_valid_from`; a model referencing any of these names fails fast with an error asking for the column to be renamed.
+
+Because the interval chain is built with portable self joins rather than window functions, materialization cost grows with the number of events per key within a batch; keep batches reasonably sized for keys that change very frequently.
+
 ### SCD Type 2 By Column
 
 SCD Type 2 By Column supports sourcing from tables that do not have an "Updated At" timestamp defined in the table.
@@ -1271,6 +1304,7 @@ This is the most accurate representation of the menu based on the source data pr
 |--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------|
 | updated_at_name          | The name of the column containing a timestamp to check for new or updated records. Default: `updated_at`                                                                           | string                    |
 | updated_at_as_valid_from | By default, for new rows `valid_from` is set to `1970-01-01 00:00:00`. This changes the behavior to set it to the valid of `updated_at` when the row is inserted. Default: `false` | bool                      |
+| multi_version_input      | Preserve every change of a business key within a batch as its own half-open validity interval instead of keeping only the latest row per key. Not supported by the By Column kind, and hard deletes are not invalidated in this mode. Default: `false` | bool                      |
 
 ### SCD Type 2 By Column Configuration Options
 

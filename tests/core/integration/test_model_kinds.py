@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import typing as t
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest import mock
 import pandas as pd  # noqa: TID253
 import pytest
 from pathlib import Path
 import time_machine
 from pytest_mock.plugin import MockerFixture
-from sqlglot import exp
+from sqlglot import exp, parse_one
 
 from sqlmesh import CustomMaterialization
 from sqlmesh.core import dialect as d
@@ -2530,6 +2530,640 @@ def test_scd_type_2_regular_run_with_offset(init_and_plan_context: t.Callable):
         assert restated_data.iloc[0]["region"] == "ANZ"
         assert str(restated_data.iloc[0]["valid_from"]) == "1970-01-01 00:00:00"
         assert pd.isna(restated_data.iloc[0]["valid_to"])
+
+
+@time_machine.travel("2023-01-05 12:00:00 UTC")
+def test_scd_type_2_multi_version_input_end_to_end(init_and_plan_context: t.Callable):
+    """Full model + plan/run flow with multi_version_input enabled on a DuckDB engine."""
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+
+    raw_events = d.parse("""
+    MODEL (
+        name memory.hr_system.raw_employee_events,
+        kind FULL
+    );
+
+    SELECT
+        1001 AS employee_id,
+        'engineering' AS department,
+        'EMEA' AS region,
+        '2023-01-01 09:00:00 UTC' AS last_modified
+    UNION ALL
+    -- Fully identical row (including the timestamp) must collapse into a single version
+    SELECT
+        1001 AS employee_id,
+        'engineering' AS department,
+        'EMEA' AS region,
+        '2023-01-01 09:00:00 UTC' AS last_modified
+    UNION ALL
+    SELECT
+        1001 AS employee_id,
+        'engineering' AS department,
+        'AMER' AS region,
+        '2023-01-02 09:00:00 UTC' AS last_modified
+    UNION ALL
+    SELECT
+        1001 AS employee_id,
+        'sales' AS department,
+        'AMER' AS region,
+        '2023-01-03 09:00:00 UTC' AS last_modified;
+    """)
+
+    employee_history = d.parse("""
+    MODEL (
+        name memory.hr_system.employee_history_mv,
+        kind SCD_TYPE_2_BY_TIME (
+            unique_key employee_id,
+            updated_at_name last_modified,
+            multi_version_input true
+        ),
+        owner hr_analytics,
+        cron '0 7 * * *'
+    );
+
+    SELECT
+        employee_id::INT AS employee_id,
+        department::TEXT AS department,
+        region::TEXT AS region,
+        last_modified AS last_modified
+    FROM
+        memory.hr_system.raw_employee_events;
+    """)
+
+    context.upsert_model(load_sql_based_model(raw_events))
+    context.upsert_model(load_sql_based_model(employee_history))
+
+    # Initial plan and apply, mirroring test_scd_type_2_regular_run_with_offset
+    plan = context.plan_builder("prod", skip_tests=True).build()
+    context.apply(plan)
+
+    query = (
+        "SELECT employee_id, department, region, valid_from, valid_to "
+        "FROM memory.hr_system.employee_history_mv ORDER BY valid_from"
+    )
+    initial_data = context.engine_adapter.fetchdf(query)
+
+    # The fully duplicate row is removed, leaving three half-open versions
+    assert len(initial_data) == 3
+    assert initial_data["department"].tolist() == ["engineering", "engineering", "sales"]
+    assert initial_data["region"].tolist() == ["EMEA", "AMER", "AMER"]
+    assert str(initial_data.iloc[0]["valid_from"]) == "2023-01-01 09:00:00"
+    assert str(initial_data.iloc[0]["valid_to"]) == "2023-01-02 09:00:00"
+    assert str(initial_data.iloc[1]["valid_from"]) == "2023-01-02 09:00:00"
+    assert str(initial_data.iloc[1]["valid_to"]) == "2023-01-03 09:00:00"
+    assert str(initial_data.iloc[2]["valid_from"]) == "2023-01-03 09:00:00"
+    assert pd.isna(initial_data.iloc[2]["valid_to"])
+
+    # A second batch with a newer event closes the open row and extends the chain
+    with time_machine.travel("2023-01-06 12:00:00 UTC"):
+        raw_events_v2 = d.parse("""
+        MODEL (
+            name memory.hr_system.raw_employee_events,
+            kind FULL
+        );
+
+        SELECT
+            1001 AS employee_id,
+            'sales' AS department,
+            'ANZ' AS region,
+            '2023-01-04 09:00:00 UTC' AS last_modified;
+        """)
+        context.upsert_model(load_sql_based_model(raw_events_v2))
+        context.plan(
+            auto_apply=True,
+            no_prompts=True,
+            categorizer_config=CategorizerConfig.all_full(),
+        )
+
+    # The run is kicked off for the SCD Type 2 model after its cron time
+    with time_machine.travel("2023-01-07 07:00:01 UTC"):
+        context.run()
+
+        second_data = context.engine_adapter.fetchdf(query)
+        assert len(second_data) == 4
+        assert pd.isna(second_data.iloc[3]["valid_to"])
+        assert str(second_data.iloc[2]["valid_to"]) == "2023-01-04 09:00:00"
+        assert second_data.iloc[3]["region"] == "ANZ"
+        # Exactly one open row for the key
+        open_rows = context.engine_adapter.fetchdf(
+            "SELECT COUNT(*) AS c FROM memory.hr_system.employee_history_mv WHERE valid_to IS NULL"
+        )
+        assert open_rows.iloc[0]["c"] == 1
+
+
+def test_scd_type_2_multi_version_input_adapter_semantics(
+    init_and_plan_context: t.Callable,
+):
+    """Direct adapter-level coverage of the multi-version interval semantics on DuckDB."""
+    from sqlmesh.utils.errors import SQLMeshError
+
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+    adapter = context.engine_adapter
+
+    target_table = "memory.hr_system.employee_history_direct"
+    columns_to_types = {
+        "employee_id": exp.DataType.build("INT"),
+        "department": exp.DataType.build("VARCHAR"),
+        "region": exp.DataType.build("VARCHAR"),
+        "last_modified": exp.DataType.build("TIMESTAMP"),
+        "valid_from": exp.DataType.build("TIMESTAMP"),
+        "valid_to": exp.DataType.build("TIMESTAMP"),
+    }
+    adapter.create_schema("memory.hr_system")
+    adapter.create_table(target_table, columns_to_types)
+
+    def source_query(rows: str) -> exp.Select:
+        return t.cast(
+            exp.Select,
+            parse_one(
+                f"SELECT * FROM (VALUES {rows}) AS t(employee_id, department, region, last_modified)"
+            ),
+        )
+
+    def run(rows: str, truncate: bool = False) -> None:
+        adapter.scd_type_2_by_time_multi_version(
+            target_table=target_table,
+            source_table=source_query(rows),
+            unique_key=[exp.column("employee_id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("last_modified", quoted=True),
+            target_columns_to_types=columns_to_types,
+            execution_time=datetime(2023, 1, 1),
+            truncate=truncate,
+        )
+
+    def fetch() -> pd.DataFrame:
+        return adapter.fetchdf(
+            f"SELECT employee_id, department, region, last_modified, valid_from, valid_to "
+            f"FROM {target_table} ORDER BY employee_id, valid_from"
+        )
+
+    # 1. First batch: three events plus a fully duplicate row -> three versions
+    run(
+        """
+        (1, 'eng', 'EMEA', TIMESTAMP '2023-01-01 09:00:00'),
+        (1, 'eng', 'EMEA', TIMESTAMP '2023-01-01 09:00:00'),
+        (1, 'eng', 'AMER', TIMESTAMP '2023-01-02 09:00:00'),
+        (1, 'sales', 'AMER', TIMESTAMP '2023-01-03 09:00:00')
+        """,
+        truncate=True,
+    )
+    data = fetch()
+    assert len(data) == 3
+    assert [pd.isna(v) for v in data["valid_to"]] == [False, False, True]
+    assert str(data.iloc[0]["valid_to"]) == "2023-01-02 09:00:00"
+    assert str(data.iloc[1]["valid_to"]) == "2023-01-03 09:00:00"
+
+    # 2. Same-timestamp content conflict raises before writing
+    with pytest.raises(SQLMeshError, match="same last_modified timestamp"):
+        run(
+            """
+            (2, 'a', 'x', TIMESTAMP '2023-02-01 08:00:00'),
+            (2, 'b', 'y', TIMESTAMP '2023-02-01 08:00:00')
+            """
+        )
+
+    # 3. Second batch: new events for key 1 and a brand new key 2; key with no event stays put
+    second_batch = """
+        (1, 'sales', 'ANZ', TIMESTAMP '2023-01-04 09:00:00'),
+        (2, 'ops', 'APAC', TIMESTAMP '2023-01-04 10:00:00')
+    """
+    run(second_batch)
+    data = fetch()
+    assert len(data) == 5
+    # Idempotent re-run produces row-for-row identical output
+    run(second_batch)
+    pd.testing.assert_frame_equal(data.reset_index(drop=True), fetch().reset_index(drop=True))
+
+    # 4. Multiple keys: exactly one open row per key and untouched keys are preserved
+    open_rows = adapter.fetchdf(
+        f"SELECT employee_id, COUNT(*) AS c FROM {target_table} "
+        "WHERE valid_to IS NULL GROUP BY employee_id ORDER BY employee_id"
+    )
+    assert open_rows["employee_id"].tolist() == [1, 2]
+    assert (open_rows["c"] == 1).all()
+
+    # 5. Adjacent no-op events (same contents, different timestamps) add no extra version
+    run(
+        """
+        (3, 'k', 'z', TIMESTAMP '2023-03-01 08:00:00'),
+        (3, 'k', 'z', TIMESTAMP '2023-03-02 08:00:00'),
+        (3, 'm', 'z', TIMESTAMP '2023-03-03 08:00:00')
+        """
+    )
+    key3 = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 3 ORDER BY valid_from"
+    )
+    assert len(key3) == 2
+    assert str(key3.iloc[0]["valid_from"]) == "2023-03-01 08:00:00"
+    assert str(key3.iloc[0]["valid_to"]) == "2023-03-03 08:00:00"
+    assert pd.isna(key3.iloc[1]["valid_to"])
+
+    # 6. An out-of-order event (older than the open row, different contents) raises
+    with pytest.raises(SQLMeshError, match="not newer than the current open row"):
+        run("(3, 'different', 'z', TIMESTAMP '2023-03-02 08:00:00')")
+
+    # 7. Re-applying an already recorded historical event is a no-op (anti-join idempotency)
+    before = fetch()
+    run("(1, 'eng', 'EMEA', TIMESTAMP '2023-01-01 09:00:00')")
+    pd.testing.assert_frame_equal(before.reset_index(drop=True), fetch().reset_index(drop=True))
+
+    # 8. A batch that replays recorded history AND adds a new event for the same key must only
+    # append the new event, never duplicate the already recorded versions
+    key1_before = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 1 ORDER BY valid_from"
+    )
+    run(
+        """
+        (1, 'eng', 'EMEA', TIMESTAMP '2023-01-01 09:00:00'),
+        (1, 'eng', 'AMER', TIMESTAMP '2023-01-02 09:00:00'),
+        (1, 'sales', 'AMER', TIMESTAMP '2023-01-03 09:00:00'),
+        (1, 'sales', 'ANZ', TIMESTAMP '2023-01-04 09:00:00'),
+        (1, 'ops', 'ANZ', TIMESTAMP '2023-01-05 09:00:00')
+        """
+    )
+    key1_after = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 1 ORDER BY valid_from"
+    )
+    # Only one additional version (the 2023-01-05 event); replayed rows add nothing
+    assert len(key1_after) == len(key1_before) + 1
+    assert str(key1_after.iloc[-1]["valid_from"]) == "2023-01-05 09:00:00"
+    assert pd.isna(key1_after.iloc[-1]["valid_to"])
+    # Re-running the same mixed batch stays idempotent
+    run(
+        """
+        (1, 'eng', 'EMEA', TIMESTAMP '2023-01-01 09:00:00'),
+        (1, 'ops', 'ANZ', TIMESTAMP '2023-01-05 09:00:00')
+        """
+    )
+    key1_rerun = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 1 ORDER BY valid_from"
+    )
+    pd.testing.assert_frame_equal(
+        key1_after.reset_index(drop=True), key1_rerun.reset_index(drop=True)
+    )
+
+    # 9. A cross-batch event with contents identical to the current open row is a no-op: it must
+    # not create a redundant adjacent version even though its timestamp is newer
+    open_row = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 1 AND valid_to IS NULL"
+    )
+    assert len(open_row) == 1
+    run(f"(1, 'ops', 'ANZ', TIMESTAMP '2023-01-06 09:00:00')")
+    after_noop = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 1 ORDER BY valid_from"
+    )
+    pd.testing.assert_frame_equal(
+        key1_after.reset_index(drop=True), after_noop.reset_index(drop=True)
+    )
+
+    # 10. Replaying an event older than the open row but with identical contents is exempt from
+    # the ordering guard (a provable no-op), rather than raising an out-of-order error
+    before_replay = fetch()
+    run(f"(1, 'ops', 'ANZ', TIMESTAMP '2022-12-31 09:00:00')")
+    pd.testing.assert_frame_equal(
+        before_replay.reset_index(drop=True), fetch().reset_index(drop=True)
+    )
+
+    # 11. A NULL event timestamp cannot be ordered into a chain and is rejected before writing
+    with pytest.raises(SQLMeshError, match="NULL"):
+        run("(4, 'x', 'z', NULL)")
+
+    # 12. A mixed batch whose contents flip back to the open row's contents must not leave the
+    # key without an open version: the open-content-matching event is only a no-op when it is the
+    # first eligible event, otherwise it is a genuine reversion that reopens its own version.
+    run("(5, 'x', 'z', TIMESTAMP '2023-04-01 08:00:00')", truncate=True)
+    run(
+        """
+        (5, 'y', 'z', TIMESTAMP '2023-04-02 08:00:00'),
+        (5, 'x', 'z', TIMESTAMP '2023-04-03 08:00:00')
+        """
+    )
+    key5 = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 5 ORDER BY valid_from"
+    )
+    assert len(key5) == 3
+    assert str(key5.iloc[0]["valid_to"]) == "2023-04-02 08:00:00"
+    assert str(key5.iloc[1]["valid_to"]) == "2023-04-03 08:00:00"
+    assert pd.isna(key5.iloc[2]["valid_to"])
+    assert key5.iloc[2]["department"] == "x"
+    # Every closed interval's valid_to points at an existing successor valid_from
+    assert key5["valid_to"].dropna().isin(key5["valid_from"]).all()
+    # Idempotent re-run keeps the repaired chain stable
+    before_key5 = key5.reset_index(drop=True)
+    run(
+        """
+        (5, 'y', 'z', TIMESTAMP '2023-04-02 08:00:00'),
+        (5, 'x', 'z', TIMESTAMP '2023-04-03 08:00:00')
+        """
+    )
+    pd.testing.assert_frame_equal(
+        before_key5,
+        adapter.fetchdf(
+            f"SELECT * FROM {target_table} WHERE employee_id = 5 ORDER BY valid_from"
+        ).reset_index(drop=True),
+    )
+
+    # Middle-position variant: an open-content-matching event between two real changes still
+    # yields exactly one open row and an unbroken valid_to -> valid_from chain.
+    run("(6, 'x', 'z', TIMESTAMP '2023-05-01 08:00:00')", truncate=True)
+    run(
+        """
+        (6, 'y', 'z', TIMESTAMP '2023-05-02 08:00:00'),
+        (6, 'x', 'z', TIMESTAMP '2023-05-03 08:00:00'),
+        (6, 'z', 'z', TIMESTAMP '2023-05-04 08:00:00')
+        """
+    )
+    key6 = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 6 ORDER BY valid_from"
+    )
+    assert len(key6) == 4
+    assert pd.isna(key6.iloc[-1]["valid_to"])
+    assert key6["valid_to"].dropna().isin(key6["valid_from"]).all()
+
+    # 13. Idempotency when the batch's FIRST event is an open-content no-op: it is skipped on the
+    # first run, so on re-run it no longer matches the (advanced) open row nor the closed history.
+    # The ordering precheck must apply the same first-event content exemption as the write path.
+    run("(7, 'a', 'z', TIMESTAMP '2023-06-01 08:00:00')", truncate=True)
+    c13_batch = """
+        (7, 'a', 'z', TIMESTAMP '2023-06-02 08:00:00'),
+        (7, 'b', 'z', TIMESTAMP '2023-06-03 08:00:00')
+    """
+    run(c13_batch)
+    key13_after_first = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 7 ORDER BY valid_from"
+    )
+    # The leading no-op added nothing: the original open row closed at 06-03, then b is open
+    assert len(key13_after_first) == 2
+    assert str(key13_after_first.iloc[0]["valid_from"]) == "2023-06-01 08:00:00"
+    assert str(key13_after_first.iloc[0]["valid_to"]) == "2023-06-03 08:00:00"
+    assert pd.isna(key13_after_first.iloc[1]["valid_to"])
+    # Re-running the identical batch must not raise and must leave the table row-for-row equal
+    run(c13_batch)
+    key13_after_rerun = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE employee_id = 7 ORDER BY valid_from"
+    )
+    pd.testing.assert_frame_equal(
+        key13_after_first.reset_index(drop=True), key13_after_rerun.reset_index(drop=True)
+    )
+
+    # 14. A NULL business key cannot participate in the equi-join interval chain and would be
+    # silently dropped, so it is rejected before writing like a NULL event timestamp.
+    with pytest.raises(SQLMeshError, match="NULL"):
+        run("(NULL, 'x', 'z', TIMESTAMP '2023-07-01 08:00:00')")
+
+
+def test_scd_type_2_multi_version_input_expression_unique_key(
+    init_and_plan_context: t.Callable,
+):
+    """An expression-based unique_key (a documented SCD2 capability) works end to end."""
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+    adapter = context.engine_adapter
+
+    target_table = "memory.hr_system.employee_history_expression_key"
+    columns_to_types = {
+        "employee_id": exp.DataType.build("INT"),
+        "department": exp.DataType.build("VARCHAR"),
+        "last_modified": exp.DataType.build("TIMESTAMP"),
+        "valid_from": exp.DataType.build("TIMESTAMP"),
+        "valid_to": exp.DataType.build("TIMESTAMP"),
+    }
+    adapter.create_schema("memory.hr_system")
+    adapter.create_table(target_table, columns_to_types)
+
+    def run(rows: str, truncate: bool = False) -> None:
+        adapter.scd_type_2_by_time_multi_version(
+            target_table=target_table,
+            source_table=parse_one(
+                f"SELECT * FROM (VALUES {rows}) AS t(employee_id, department, last_modified)"
+            ),
+            unique_key=[parse_one("employee_id + 1")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("last_modified", quoted=True),
+            target_columns_to_types=columns_to_types,
+            execution_time=datetime(2023, 1, 1),
+            truncate=truncate,
+        )
+
+    run(
+        """
+        (1, 'eng', TIMESTAMP '2023-01-01 09:00:00'),
+        (1, 'sales', TIMESTAMP '2023-01-02 09:00:00'),
+        (2, 'eng', TIMESTAMP '2023-01-01 09:00:00')
+        """,
+        truncate=True,
+    )
+    data = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY employee_id, valid_from")
+    assert len(data) == 3
+    open_rows = adapter.fetchdf(
+        f"SELECT employee_id, COUNT(*) AS c FROM {target_table} "
+        "WHERE valid_to IS NULL GROUP BY employee_id ORDER BY employee_id"
+    )
+    assert open_rows.values.tolist() == [[1, 1], [2, 1]]
+
+    # A newer event plus an idempotent re-run exercises every key-bearing join on the alias
+    run("(1, 'ops', TIMESTAMP '2023-01-03 09:00:00')")
+    before = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY employee_id, valid_from")
+    run("(1, 'ops', TIMESTAMP '2023-01-03 09:00:00')")
+    after = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY employee_id, valid_from")
+    pd.testing.assert_frame_equal(before.reset_index(drop=True), after.reset_index(drop=True))
+    assert len(after) == 4
+
+
+@pytest.mark.parametrize("reserved_column", ["_key0", "_next_updated_at"])
+def test_scd_type_2_multi_version_input_reserved_column_name(
+    init_and_plan_context: t.Callable, reserved_column: str
+):
+    """A column named like an internal CTE alias is rejected with a clear error before any write."""
+    from sqlmesh.utils.errors import SQLMeshError
+
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+    adapter = context.engine_adapter
+
+    target_table = f"memory.hr_system.employee_history_reserved_{reserved_column.lstrip('_')}"
+    columns_to_types = {
+        "employee_id": exp.DataType.build("INT"),
+        reserved_column: exp.DataType.build("VARCHAR"),
+        "last_modified": exp.DataType.build("TIMESTAMP"),
+        "valid_from": exp.DataType.build("TIMESTAMP"),
+        "valid_to": exp.DataType.build("TIMESTAMP"),
+    }
+    adapter.create_schema("memory.hr_system")
+    adapter.create_table(target_table, columns_to_types)
+
+    with pytest.raises(SQLMeshError, match=reserved_column):
+        adapter.scd_type_2_by_time_multi_version(
+            target_table=target_table,
+            source_table=parse_one(
+                f"SELECT * FROM (VALUES (1, 'x', TIMESTAMP '2023-01-01 09:00:00')) "
+                f"AS t(employee_id, {reserved_column}, last_modified)"
+            ),
+            unique_key=[exp.column("employee_id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("last_modified", quoted=True),
+            target_columns_to_types=columns_to_types,
+            execution_time=datetime(2023, 1, 1),
+            truncate=True,
+        )
+
+    # The guard fires before the rewrite, so the target stays empty
+    assert len(adapter.fetchdf(f"SELECT * FROM {target_table}")) == 0
+
+
+def test_scd_type_2_multi_version_input_mixed_expression_composite_key(
+    init_and_plan_context: t.Callable,
+):
+    """A composite unique key mixing a column and an expression is threaded on the key aliases."""
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+    adapter = context.engine_adapter
+
+    target_table = "memory.hr_system.employee_history_mixed_expression_key"
+    columns_to_types = {
+        "tenant_id": exp.DataType.build("INT"),
+        "employee_id": exp.DataType.build("INT"),
+        "department": exp.DataType.build("VARCHAR"),
+        "last_modified": exp.DataType.build("TIMESTAMP"),
+        "valid_from": exp.DataType.build("TIMESTAMP"),
+        "valid_to": exp.DataType.build("TIMESTAMP"),
+    }
+    adapter.create_schema("memory.hr_system")
+    adapter.create_table(target_table, columns_to_types)
+
+    def run(rows: str, truncate: bool = False) -> None:
+        adapter.scd_type_2_by_time_multi_version(
+            target_table=target_table,
+            source_table=parse_one(
+                f"SELECT * FROM (VALUES {rows}) AS t(tenant_id, employee_id, department, last_modified)"
+            ),
+            unique_key=[exp.column("tenant_id"), parse_one("employee_id + 1")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("last_modified", quoted=True),
+            target_columns_to_types=columns_to_types,
+            execution_time=datetime(2023, 1, 1),
+            truncate=truncate,
+        )
+
+    run(
+        """
+        (1, 10, 'eng', TIMESTAMP '2023-01-01 09:00:00'),
+        (1, 10, 'sales', TIMESTAMP '2023-01-02 09:00:00'),
+        (2, 10, 'eng', TIMESTAMP '2023-01-01 09:00:00')
+        """,
+        truncate=True,
+    )
+    open_rows = adapter.fetchdf(
+        f"SELECT tenant_id, employee_id, COUNT(*) AS c FROM {target_table} "
+        "WHERE valid_to IS NULL GROUP BY tenant_id, employee_id ORDER BY tenant_id, employee_id"
+    )
+    assert open_rows.values.tolist() == [[1, 10, 1], [2, 10, 1]]
+
+    # An alternating X -> Y -> X batch keeps one open row and an unbroken interval chain,
+    # exercising the first_events rule together with the expression key alias joins
+    run(
+        """
+        (1, 10, 'eng', TIMESTAMP '2023-01-03 09:00:00'),
+        (1, 10, 'sales', TIMESTAMP '2023-01-04 09:00:00')
+        """
+    )
+    key_rows = adapter.fetchdf(
+        f"SELECT * FROM {target_table} WHERE tenant_id = 1 ORDER BY valid_from"
+    )
+    assert len(key_rows) == 4
+    assert pd.isna(key_rows.iloc[-1]["valid_to"])
+    assert key_rows["valid_to"].dropna().isin(key_rows["valid_from"]).all()
+    # The other composite key stays untouched and the rerun is idempotent
+    untouched = adapter.fetchdf(f"SELECT * FROM {target_table} WHERE tenant_id = 2")
+    assert len(untouched) == 1 and pd.isna(untouched.iloc[0]["valid_to"])
+    before = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY tenant_id, valid_from")
+    run(
+        """
+        (1, 10, 'eng', TIMESTAMP '2023-01-03 09:00:00'),
+        (1, 10, 'sales', TIMESTAMP '2023-01-04 09:00:00')
+        """
+    )
+    after = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY tenant_id, valid_from")
+    pd.testing.assert_frame_equal(before.reset_index(drop=True), after.reset_index(drop=True))
+
+
+def test_scd_type_2_multi_version_input_composite_key(init_and_plan_context: t.Callable):
+    """The anti joins and interval chain work with a multi-column unique key."""
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+    adapter = context.engine_adapter
+
+    target_table = "memory.hr_system.employee_history_composite"
+    columns_to_types = {
+        "tenant_id": exp.DataType.build("INT"),
+        "employee_id": exp.DataType.build("INT"),
+        "department": exp.DataType.build("VARCHAR"),
+        "last_modified": exp.DataType.build("TIMESTAMP"),
+        "valid_from": exp.DataType.build("TIMESTAMP"),
+        "valid_to": exp.DataType.build("TIMESTAMP"),
+    }
+    adapter.create_schema("memory.hr_system")
+    adapter.create_table(target_table, columns_to_types)
+
+    def run(rows: str, truncate: bool = False) -> None:
+        adapter.scd_type_2_by_time_multi_version(
+            target_table=target_table,
+            source_table=parse_one(
+                f"SELECT * FROM (VALUES {rows}) AS t(tenant_id, employee_id, department, last_modified)"
+            ),
+            unique_key=[exp.column("tenant_id"), exp.column("employee_id")],
+            valid_from_col=exp.column("valid_from", quoted=True),
+            valid_to_col=exp.column("valid_to", quoted=True),
+            updated_at_col=exp.column("last_modified", quoted=True),
+            target_columns_to_types=columns_to_types,
+            execution_time=datetime(2023, 1, 1),
+            truncate=truncate,
+        )
+
+    run(
+        """
+        (1, 10, 'eng', TIMESTAMP '2023-01-01 09:00:00'),
+        (1, 10, 'sales', TIMESTAMP '2023-01-02 09:00:00'),
+        (2, 10, 'eng', TIMESTAMP '2023-01-01 09:00:00')
+        """,
+        truncate=True,
+    )
+    data = adapter.fetchdf(
+        f"SELECT tenant_id, employee_id, department, valid_from, valid_to "
+        f"FROM {target_table} ORDER BY tenant_id, valid_from"
+    )
+    assert len(data) == 3
+    # Tenant 1 key 10 has a closed and an open version; tenant 2 key 10 keeps its single open row
+    open_rows = adapter.fetchdf(
+        f"SELECT tenant_id, employee_id, COUNT(*) AS c FROM {target_table} "
+        "WHERE valid_to IS NULL GROUP BY tenant_id, employee_id ORDER BY tenant_id, employee_id"
+    )
+    assert open_rows.values.tolist() == [[1, 10, 1], [2, 10, 1]]
+
+    # A newer event only for (1, 10) must leave (2, 10) untouched and keep one open row per key
+    run("(1, 10, 'ops', TIMESTAMP '2023-01-03 09:00:00')")
+    data = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY tenant_id, valid_from")
+    assert len(data) == 4
+    untouched = data[(data["tenant_id"] == 2) & (data["employee_id"] == 10)]
+    assert len(untouched) == 1
+    assert pd.isna(untouched.iloc[0]["valid_to"])
+    open_rows = adapter.fetchdf(
+        f"SELECT tenant_id, employee_id, COUNT(*) AS c FROM {target_table} "
+        "WHERE valid_to IS NULL GROUP BY tenant_id, employee_id ORDER BY tenant_id, employee_id"
+    )
+    assert open_rows.values.tolist() == [[1, 10, 1], [2, 10, 1]]
+    # Re-running the same batch is idempotent for the composite key
+    before = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY tenant_id, valid_from")
+    run("(1, 10, 'ops', TIMESTAMP '2023-01-03 09:00:00')")
+    after = adapter.fetchdf(f"SELECT * FROM {target_table} ORDER BY tenant_id, valid_from")
+    pd.testing.assert_frame_equal(before.reset_index(drop=True), after.reset_index(drop=True))
 
 
 def test_seed_model_metadata_update_does_not_trigger_backfill(tmp_path: Path):

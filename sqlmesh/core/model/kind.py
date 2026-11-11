@@ -826,10 +826,29 @@ class SCDType2ByTimeKind(_SCDType2Kind):
     )
     updated_at_name: SQLGlotColumn = Field(exp.column("updated_at"), validate_default=True)
     updated_at_as_valid_from: SQLGlotBool = False
+    # When enabled, every change of a business key within a batch is preserved as its own
+    # version instead of only keeping the latest row per unique key. Not supported by the
+    # by-column variant and hard deletes are not invalidated in this mode.
+    multi_version_input: SQLGlotBool = False
 
     _always_validate_updated_at = field_validator("updated_at_name", mode="before")(
         column_validator
     )
+
+    @field_validator("multi_version_input", mode="after")
+    @classmethod
+    def _validate_multi_version_input(cls, multi_version_input: bool, info: ValidationInfo) -> bool:
+        if multi_version_input and info.data.get("invalidate_hard_deletes"):
+            raise ConfigError(
+                "`multi_version_input` cannot be combined with `invalidate_hard_deletes` because "
+                "hard deletes are not invalidated in multi-version input mode."
+            )
+        if multi_version_input and info.data.get("updated_at_as_valid_from"):
+            raise ConfigError(
+                "`multi_version_input` cannot be combined with `updated_at_as_valid_from` because "
+                "`valid_from` is always the event timestamp in multi-version input mode."
+            )
+        return multi_version_input
 
     @property
     def data_hash_values(self) -> t.List[t.Optional[str]]:
@@ -837,6 +856,7 @@ class SCDType2ByTimeKind(_SCDType2Kind):
             *super().data_hash_values,
             gen(self.updated_at_name),
             str(self.updated_at_as_valid_from),
+            str(self.multi_version_input),
         ]
 
     def to_expression(
@@ -849,6 +869,7 @@ class SCDType2ByTimeKind(_SCDType2Kind):
                     {
                         "updated_at_name": self.updated_at_name,
                         "updated_at_as_valid_from": self.updated_at_as_valid_from,
+                        "multi_version_input": self.multi_version_input,
                     }
                 ),
             ],

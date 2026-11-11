@@ -298,6 +298,7 @@ Configuration options for [`SCD_TYPE_2_BY_TIME` models](../concepts/models/model
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--: | :------: |
 | `updated_at_name`          | The model column containing each row's updated at date. (Default: `updated_at`)                                                                                                  | str  |    N     |
 | `updated_at_as_valid_from` | By default, for new rows the `valid_from` column is set to 1970-01-01 00:00:00. This sets `valid_from` to the value of `updated_at` when the row is inserted. (Default: `False`) | bool |    N     |
+| `multi_version_input`      | Preserve every change of a business key within a batch as its own half-open validity interval instead of only the latest row per key. Hard deletes are not invalidated, and it cannot be combined with `invalidate_hard_deletes` or `updated_at_as_valid_from`. (Default: `False`) | bool |    N     |
 
 Python model kind `name` enum value: [ModelKindName.SCD_TYPE_2_BY_TIME](https://sqlmesh.readthedocs.io/en/stable/_readthedocs/html/sqlmesh/core/model/kind.html#ModelKindName)
 

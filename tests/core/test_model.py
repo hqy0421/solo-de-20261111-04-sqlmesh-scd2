@@ -5989,6 +5989,126 @@ def test_scd_type_2_by_time_overrides():
     assert scd_type_2_model.kind == _model_kind_validator(None, model_kind_dict, None)
 
 
+def test_scd_type_2_by_time_multi_version_input():
+    # The multi-version input mode is opt-in and disabled by default
+    default_model = load_sql_based_model(
+        d.parse(
+            """
+        MODEL (
+            name db.table,
+            kind SCD_TYPE_2_BY_TIME (
+                unique_key id
+            )
+        );
+        SELECT 1 AS id, 'a' AS name, '2020-01-01' AS updated_at;
+        """
+        )
+    )
+    assert default_model.kind.multi_version_input is False
+
+    model_def = d.parse(
+        """
+        MODEL (
+            name db.table,
+            kind SCD_TYPE_2_BY_TIME (
+                unique_key id,
+                multi_version_input true
+            )
+        );
+        SELECT 1 AS id, 'a' AS name, '2020-01-01' AS updated_at;
+        """
+    )
+    scd_type_2_model = load_sql_based_model(model_def)
+    assert scd_type_2_model.kind.multi_version_input is True
+    assert scd_type_2_model.kind.is_scd_type_2_by_time
+
+    # The property participates in the data hash so that toggling it creates a new snapshot
+    assert "True" in scd_type_2_model.kind.data_hash_values
+    assert "False" in default_model.kind.data_hash_values
+
+    # The property is serialized into the kind expression so that round trips are stable
+    kind_sql = scd_type_2_model.kind.to_expression().sql()
+    assert "multi_version_input TRUE" in kind_sql
+    assert "multi_version_input FALSE" in default_model.kind.to_expression().sql()
+
+    # Dict round trip preserves the property
+    model_kind_dict = scd_type_2_model.kind.dict()
+    assert model_kind_dict["multi_version_input"] is True
+    assert scd_type_2_model.kind == _model_kind_validator(None, model_kind_dict, None)
+
+    # The legacy SCD_TYPE_2 alias also supports the property
+    legacy_model = load_sql_based_model(
+        d.parse(
+            """
+        MODEL (
+            name db.table,
+            kind SCD_TYPE_2 (
+                unique_key id,
+                multi_version_input true
+            )
+        );
+        SELECT 1 AS id, 'a' AS name, '2020-01-01' AS updated_at;
+        """
+        )
+    )
+    assert legacy_model.kind.multi_version_input is True
+
+    # The by-column variant does not support the multi-version input mode
+    with pytest.raises(ConfigError, match="multi_version_input"):
+        load_sql_based_model(
+            d.parse(
+                """
+            MODEL (
+                name db.table,
+                kind SCD_TYPE_2_BY_COLUMN (
+                    unique_key id,
+                    columns [name],
+                    multi_version_input true
+                )
+            );
+            SELECT 1 AS id, 'a' AS name;
+            """
+            )
+        )
+
+    # Hard delete invalidation is not supported in multi-version input mode
+    with pytest.raises(ConfigError, match="invalidate_hard_deletes"):
+        load_sql_based_model(
+            d.parse(
+                """
+            MODEL (
+                name db.table,
+                kind SCD_TYPE_2_BY_TIME (
+                    unique_key id,
+                    multi_version_input true,
+                    invalidate_hard_deletes true
+                )
+            );
+            SELECT 1 AS id, 'a' AS name, '2020-01-01' AS updated_at;
+            """
+            )
+        )
+
+    # updated_at_as_valid_from is meaningless in multi-version mode because valid_from is
+    # always derived from the event timestamp, so the combination is rejected at config time
+    with pytest.raises(ConfigError, match="updated_at_as_valid_from"):
+        load_sql_based_model(
+            d.parse(
+                """
+            MODEL (
+                name db.table,
+                kind SCD_TYPE_2_BY_TIME (
+                    unique_key id,
+                    multi_version_input true,
+                    updated_at_as_valid_from true
+                )
+            );
+            SELECT 1 AS id, 'a' AS name, '2020-01-01' AS updated_at;
+            """
+            )
+        )
+
+
 def test_scd_type_2_by_column_defaults():
     model_def = d.parse(
         """
@@ -9008,6 +9128,7 @@ batch_size 1000
         == """SCD_TYPE_2_BY_TIME (
 updated_at_name "updated_at",
 updated_at_as_valid_from FALSE,
+multi_version_input FALSE,
 unique_key ("a", "b"),
 valid_from_name "valid_from",
 valid_to_name "valid_to",
